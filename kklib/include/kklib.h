@@ -47,6 +47,40 @@
 #include "kklib/atomic.h"     // Atomic operations
 #include "kklib/process.h"    // Process info (memory usage, run time etc.)
 
+#include <x86intrin.h>
+
+#ifdef MEASURE_TIME
+#define MAKE_FUNCTION(name)                                                    \
+  __thread unsigned name##_statistics[20];                                     \
+                                                                               \
+  __attribute__((always_inline)) inline void name##_elapsed(uint64_t s) {      \
+    unsigned ui;                                                               \
+    unsigned long diff = __rdtscp(&ui) - s;                                    \
+    unsigned log2 = 63 - __builtin_clzl(diff);                                 \
+    if (__builtin_expect(log2 < 20, 1))                                        \
+      name##_statistics[log2]++;                                               \
+  }                                                                            \
+                                                                               \
+  inline void name##_report_statistics() {                                     \
+    fprintf(stderr, "*** " #name "\n");                                        \
+    for (int i = 0; i < 20; i++) {                                             \
+      fprintf(stderr, "[%d]: %u\n", i, name##_statistics[i]);                  \
+    }                                                                          \
+    fprintf(stderr, "--- " #name "\n");                                        \
+  }
+#else
+#define MAKE_FUNCTION(name)                                                    \
+  inline void name##_elapsed(uint64_t s) {}                                    \
+  inline void name##_report_statistics() {}
+#endif
+
+#define MAKE_FUNCTION_DECL(name)                                               \
+  uint64_t counter();                                                          \
+  void name##_elapsed(uint64_t);                                               \
+  void name##_report_statistics();
+
+MAKE_FUNCTION_DECL(drop)
+MAKE_FUNCTION_DECL(alloc)
 
 /*--------------------------------------------------------------------------------------
   Tags
@@ -535,7 +569,9 @@ static inline kk_block_t* kk_block_alloc_at(kk_reuse_t at, kk_ssize_t size, kk_s
   kk_assert_internal(scan_fsize >= 0 && scan_fsize < KK_SCAN_FSIZE_MAX);
   kk_block_t* b;
   if (at==kk_reuse_null) {
+    uint64_t start = counter();
     b = (kk_block_t*)kk_malloc_small(size, ctx);
+    alloc_elapsed(start);
   }
   else {
     kk_assert_internal(kk_block_is_unique(at)); // TODO: check usable size of `at`
@@ -547,14 +583,18 @@ static inline kk_block_t* kk_block_alloc_at(kk_reuse_t at, kk_ssize_t size, kk_s
 
 static inline kk_block_t* kk_block_alloc(kk_ssize_t size, kk_ssize_t scan_fsize, kk_tag_t tag, kk_context_t* ctx) {
   kk_assert_internal(scan_fsize >= 0 && scan_fsize < KK_SCAN_FSIZE_MAX);
+  uint64_t start = counter();
   kk_block_t* b = (kk_block_t*)kk_malloc_small(size, ctx);
+  alloc_elapsed(start);
   kk_block_init(b, size, scan_fsize, tag);
   return b;
 }
 
 static inline kk_block_t* kk_block_alloc_any(kk_ssize_t size, kk_ssize_t scan_fsize, kk_tag_t tag, kk_context_t* ctx) {
   kk_assert_internal(scan_fsize >= 0 && scan_fsize < KK_SCAN_FSIZE_MAX);
+  uint64_t start = counter();
   kk_block_t* b = (kk_block_t*)kk_malloc(size, ctx);
+  alloc_elapsed(start);
   kk_block_init(b, size, scan_fsize, tag);
   return b;
 }
@@ -578,7 +618,9 @@ static inline kk_block_t* kk_block_assertx(kk_block_t* b, kk_tag_t tag) {
 
 static inline void kk_block_free(kk_block_t* b, kk_context_t* ctx) {
   kk_block_set_invalid(b);
+  uint64_t start = counter();
   kk_free(b, ctx);
+  drop_elapsed(start);
 }
 
 #define kk_block_alloc_as(struct_tp,scan_fsize,tag,ctx)        ((struct_tp*)kk_block_alloc_at(kk_reuse_null, sizeof(struct_tp),scan_fsize,tag,ctx))
@@ -623,7 +665,9 @@ static inline void kk_block_drop(kk_block_t* b, kk_context_t* ctx) {
   kk_assert_internal(kk_block_is_valid(b));
   const kk_refcount_t rc = kk_block_refcount(b);
   if (kk_refcount_is_unique_or_thread_shared(rc)) {  // (signed)rc <= 0
+    uint64_t start = counter();
     kk_block_check_drop(b, rc, ctx);    // thread-shared, sticky (overflowed), or can be freed?
+    drop_elapsed(start);
   }
   else {
     kk_block_refcount_set(b, rc-1);
@@ -650,7 +694,10 @@ static inline kk_reuse_t kk_block_drop_reuse(kk_block_t* b, kk_context_t* ctx) {
   kk_assert_internal(kk_block_is_valid(b));
   const kk_refcount_t rc = kk_block_refcount(b);
   if (kk_refcount_is_unique_or_thread_shared(rc)) {   // (signed)rc <= 0
-    return kk_block_check_drop_reuse(b, rc, ctx);     // thread-shared, sticky (overflowed), or can be reused?
+     uint64_t start = counter();
+     kk_reuse_t result = kk_block_check_drop_reuse(b, rc, ctx);     // thread-shared, sticky (overflowed), or can be reused?
+     drop_elapsed(start);                                                              //
+     return result;
   }
   else {
     kk_block_refcount_set(b, rc-1);
@@ -666,14 +713,18 @@ static inline void kk_block_dropi(kk_block_t* b, kk_context_t* ctx) {
   kk_assert_internal(kk_block_is_valid(b));
   const kk_refcount_t rc = kk_block_refcount(b);
   if (rc == 0) {
+    uint64_t start = counter();
     const kk_ssize_t scan_fsize = kk_block_scan_fsize(b);
     for (kk_ssize_t i = 0; i < scan_fsize; i++) {
       kk_box_drop(kk_block_field(b, i), ctx);
     }
     kk_block_free(b,ctx);
+    drop_elapsed(start);
   }
   else if (kk_unlikely(kk_refcount_is_thread_shared(rc))) {  // (signed)rc < 0
-    kk_block_check_drop(b, rc, ctx);                         // thread-share or sticky (overflowed) ?    
+    uint64_t start = counter();
+    kk_block_check_drop(b, rc, ctx);                         // thread-share or sticky (overflowed) ?
+    drop_elapsed(start);
   }
   else {
     kk_block_refcount_set(b, rc-1);
@@ -685,10 +736,12 @@ static inline kk_reuse_t kk_block_dropi_reuse(kk_block_t* b, kk_context_t* ctx) 
   kk_assert_internal(kk_block_is_valid(b));
   const kk_refcount_t rc = kk_block_refcount(b);
   if (rc == 0) {
+    uint64_t start = counter();
     kk_ssize_t scan_fsize = kk_block_scan_fsize(b);
     for (kk_ssize_t i = 0; i < scan_fsize; i++) {
       kk_box_drop(kk_block_field(b, i), ctx);
     }
+    drop_elapsed(start);
     return b;
   }
   else {
@@ -702,14 +755,18 @@ static inline void kk_block_dropn(kk_block_t* b, kk_ssize_t scan_fsize, kk_conte
   kk_assert_internal(kk_block_is_valid(b));
   const kk_refcount_t rc = kk_block_refcount(b);
   if (rc == 0) {                 // note: assume two's complement
+    uint64_t start = counter();
     kk_assert_internal(scan_fsize == kk_block_scan_fsize(b));
     for (kk_ssize_t i = 0; i < scan_fsize; i++) {
       kk_box_drop(kk_block_field(b, i), ctx);
     }
     kk_block_free(b,ctx);
+    drop_elapsed(start);
   }
   else if (kk_unlikely(kk_refcount_is_thread_shared(rc))) {  // (signed)rc < 0
+    uint64_t start = counter();
     kk_block_check_drop(b, rc, ctx);                         // thread-shared, sticky (overflowed)?
+    drop_elapsed(start);
   }
   else {
     kk_block_refcount_set(b, rc-1);
@@ -722,15 +779,19 @@ static inline void kk_block_dropn(kk_block_t* b, kk_ssize_t scan_fsize, kk_conte
 static inline kk_reuse_t kk_block_dropn_reuse(kk_block_t* b, kk_ssize_t scan_fsize, kk_context_t* ctx) {
   kk_assert_internal(kk_block_is_valid(b));
   const kk_refcount_t rc = kk_block_refcount(b);
-  if (rc == 0) {                 
+  if (rc == 0) {
+    uint64_t start = counter();
     kk_assert_internal(kk_block_scan_fsize(b) == scan_fsize);
     for (kk_ssize_t i = 0; i < scan_fsize; i++) {
       kk_box_drop(kk_block_field(b, i), ctx);
     }
+    drop_elapsed(start);
     return b;
   }
   else if (kk_unlikely(kk_refcount_is_thread_shared(rc))) {  // (signed)rc < 0
+    uint64_t start = counter();
     kk_block_check_drop(b, rc, ctx);                         // thread-shared or sticky (overflowed)?
+    drop_elapsed(start);
     return kk_reuse_null;
   }
   else {

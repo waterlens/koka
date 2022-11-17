@@ -33,4 +33,5 @@
 #include "thread.c"
 #include "time.c"
 #include "vector.c"
+#include "trace.c"
 

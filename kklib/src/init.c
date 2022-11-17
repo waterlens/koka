@@ -142,6 +142,8 @@ static void kklib_done(void) {
   if (!process_initialized) return;
   kk_free_context();
   process_initialized = false;
+  drop_report_statistics();
+  alloc_report_statistics();
 }
 
 
